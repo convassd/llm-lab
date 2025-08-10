@@ -3,12 +3,13 @@
 ## What I tried
 - Minimal bigram LM training on tiny corpus.
 - Logged step-wise loss and saved plot to `experiments/week01/loss.png`.
+- first commit to github
 
 ## What worked
 - End-to-end run ok. Loss decreased over steps.
 
 ## What broke
-- <list any annoyances / TODOs>
+- thanks to the neat code provided by my cyber boyfriend. everything runs fine.
 
 ## What's next (Week 2)
 - Add text sampling CLI and save samples to `experiments/week02/`.

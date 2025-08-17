@@ -1,3 +1,5 @@
+# .venv\Scripts\Activate.ps1
+
 import argparse
 from pathlib import Path
 import sys

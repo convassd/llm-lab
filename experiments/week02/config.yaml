@@ -1,0 +1,13 @@
+corpus_path: "experiments/week01/tiny_corpus.txt"
+steps: 800
+lr: 1.0
+batch_size: 256
+seed: 1337
+device: "auto"   # "cuda", "cpu", or "auto"
+
+sample:
+  start_char: "T"         # starting character for prompt (fallback to first char in corpus if missing)
+  max_new_tokens: 300
+  temperature: 1.0        # 0 or <=0 => greedy
+  top_k: null             # e.g., 40
+  top_p: null             # e.g., 0.95

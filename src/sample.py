@@ -1,12 +1,18 @@
+# src/sample.py
 from pathlib import Path
+import json
+import yaml
+import torch
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-import torch
 from src.model import BigramLM
-from src.data import decode, build_vocab, load_text
+from src.data import load_text, build_vocab, decode
 
-def sample_next_token(
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = PROJECT_ROOT / "experiments/week02/config.yaml"
+
+def sample_next_token_from_logits(
     logits_last_step: torch.Tensor,
     *,
     temperature: float = 1.0,
@@ -14,88 +20,98 @@ def sample_next_token(
     top_p: float | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """
-    logits_last_step: (V,) or (1, V) tensor of logits for the next token.
-    returns: (1,) int64 token id
-    """
     # ensure shape (V,)
     if logits_last_step.dim() == 2:
         logits_last_step = logits_last_step.squeeze(0)
 
-    # temperature
+    if temperature is None:
+        temperature = 1.0
+
     if temperature <= 0:
-        # "greedy" fallback if someone passes 0 or a negative
         return torch.argmax(logits_last_step, dim=-1, keepdim=False)
 
     logits = logits_last_step / float(temperature)
-
     V = logits.size(-1)
 
-    # top-k: keep k highest logits
+    # top-k
     if top_k is not None and 0 < top_k < V:
-        topk_vals, topk_idx = torch.topk(logits, top_k)
-        mask = torch.full_like(logits, float("-inf"))
-        mask.scatter_(0, topk_idx, topk_vals)
-        logits = mask  # masked logits (others -inf)
+        top_vals, top_idx = torch.topk(logits, top_k)
+        masked = torch.full_like(logits, float("-inf"))
+        masked.scatter_(0, top_idx, top_vals)
+        logits = masked
 
-    # top-p (nucleus): keep smallest set with cumulative prob >= p
+    # top-p (nucleus)
     if top_p is not None and 0.0 < top_p < 1.0:
         probs = torch.softmax(logits, dim=-1)
         sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumprobs = torch.cumsum(sorted_probs, dim=-1)
-        keep_mask_sorted = cumprobs <= top_p
-        # always keep the largest-prob token
-        keep_mask_sorted[..., 0] = True
-        keep_idx = sorted_idx[keep_mask_sorted]
-        # mask out everything not in nucleus
-        mask = torch.full_like(logits, float("-inf"))
-        mask[keep_idx] = logits[keep_idx]
-        logits = mask
+        cum = torch.cumsum(sorted_probs, dim=-1)
+        keep_sorted = cum <= top_p
+        keep_sorted[..., 0] = True  # always keep top-1
+        keep_idx = sorted_idx[keep_sorted]
+        masked = torch.full_like(logits, float("-inf"))
+        masked[keep_idx] = logits[keep_idx]
+        logits = masked
 
-    # sample
     probs = torch.softmax(logits, dim=-1)
-    next_id = torch.argmax(probs, dim=-1)
+    next_id = torch.multinomial(probs, num_samples=1, generator=generator)
     return next_id.squeeze(0)
 
-def load_model_from_ckpt(ckpt_path, device="cpu"):
-    device = torch.device(device)
+def load_model_and_vocab(ckpt_path: Path, device: torch.device):
+    # load state dict (weights_only=True is safer with your own checkpoints)
     state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    w = state["embed.weight"]                    # tensor with shape [V, V] in your bigram LM
-    vocab_size = w.shape[0]                      # infer V
+
+    # infer vocab size from weights (for bigram LM it's square [V,V])
+    W = state["embed.weight"]
+    vocab_size = int(W.shape[0])
+
     model = BigramLM(vocab_size=vocab_size).to(device)
-    model.load_state_dict(state)                 # shapes match now
+    model.load_state_dict(state)
     model.eval()
-    return model, vocab_size
+
+    # load vocab.json saved by training
+    vocab_json = ckpt_path.parent / "vocab.json"
+    if vocab_json.exists():
+        with open(vocab_json, "r", encoding="utf-8") as f:
+            chars = json.load(f)["chars"]
+    else:
+        # fallback: rebuild from corpus (less safe)
+        raise FileNotFoundError(f"Missing vocab.json at {vocab_json}")
+
+    itos = {i: ch for i, ch in enumerate(chars)}
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    return model, stoi, itos
 
 def generate_text(
-    ckpt_path,
-    start_token=0,
-    max_new_tokens=50,
-    device="cpu",
+    ckpt_path: Path,
     *,
-    temperature: float = 1.0,
-    top_k: int | None = None,
-    top_p: float | None = None,
-    seed: int | None = None,
+    start_ids: list[int] | None,
+    max_new_tokens: int,
+    device: torch.device,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+    seed: int | None,
 ):
-    model, vocab_size = load_model_from_ckpt(ckpt_path, device)
-    start_token = int(start_token) % vocab_size
+    model, stoi, itos = load_model_and_vocab(ckpt_path, device)
+    V = len(itos)
 
-    # optional deterministic sampling seed
+    if start_ids and len(start_ids) > 0:
+        start_ids = [int(i) % V for i in start_ids]
+        idx = torch.tensor([start_ids], dtype=torch.long, device=device)
+    else:
+        # if nothing provided, fall back to first char in corpus (from vocab order)
+        idx = torch.tensor([[0]], dtype=torch.long, device=device)
+
     gen = None
     if seed is not None:
-        gen = torch.Generator(device=model.embed.weight.device).manual_seed(seed)
+        gen = torch.Generator(device=device).manual_seed(int(seed))
 
-    idx = torch.tensor([[start_token]], dtype=torch.long, device=model.embed.weight.device)
-
-    model.eval()
     with torch.no_grad():
-        for _ in range(max_new_tokens):
-            logits = model(idx)          # (B, T, V)
-            logits = logits[:, -1, :]    # (B, V) → last step
-            # sample one token with your knobs
-            next_id = sample_next_token(
-                logits.squeeze(0),
+        for _ in range(int(max_new_tokens)):
+            logits = model(idx)  # (B,T,V) or (B,V) depending on your impl
+            logits_last = logits[:, -1, :] if logits.dim() == 3 else logits
+            next_id = sample_next_token_from_logits(
+                logits_last.squeeze(0),
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -103,15 +119,59 @@ def generate_text(
             ).view(1, 1)
             idx = torch.cat([idx, next_id], dim=1)
 
-    return idx[0].tolist()
+    tokens = idx[0].tolist()
+    text = decode(tokens, itos)
+    return text
+
+def main():
+    # --- load config ---
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # --- resolve device ---
+    dev = cfg.get("device", "auto")
+    if dev == "auto":
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(dev)
+
+    # derive checkpoint path from corpus_path
+    corpus_path = PROJECT_ROOT / cfg["corpus_path"]
+    ckpt_path = corpus_path.parent / "checkpoints" / "bigram.pt"
+    save_dir = PROJECT_ROOT / cfg["save_dir"]
+    sample_cfg = cfg.get("sample", {}) or {}
+    start_char = sample_cfg.get("start_char", "")
+    max_new_tokens = int(sample_cfg.get("max_new_tokens", 300))
+    temperature = float(sample_cfg.get("temperature", 1.0))
+    top_k = sample_cfg.get("top_k", None)
+    top_p = sample_cfg.get("top_p", None)
+    seed = int(cfg.get("seed", 1337))
+
+    # build start_ids from start_char using saved vocab
+    # (we load stoi via load_model_and_vocab below, but we need it now; so read vocab.json directly)
+    vocab_json = ckpt_path.parent / "vocab.json"
+    with open(vocab_json, "r", encoding="utf-8") as f:
+        chars = json.load(f)["chars"]
+    stoi = {ch: i for i, ch in enumerate(chars)}
+
+    start_ids = None
+    if start_char:
+        # filter to known chars (for bigram only last char matters, but accept full string)
+        filtered = [c for c in start_char if c in stoi]
+        if filtered:
+            start_ids = [stoi[c] for c in filtered]
+
+    sample_text = generate_text(
+        ckpt_path=ckpt_path,
+        start_ids=start_ids,
+        max_new_tokens=max_new_tokens,
+        device=device,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        seed=seed,
+    )
+    (save_dir / "sample.txt").write_text(sample_text, encoding="utf-8")
+    print(f"Saved sample text to {save_dir / 'sample.txt'}")
 
 if __name__ == "__main__":
-    corpus_path = "experiments/week01/tiny_corpus.txt"
-    text_corpus = load_text(corpus_path)           # read the file contents
-    chars, stoi, itos = build_vocab(text_corpus)   # build vocab from text
-    tokens = generate_text("experiments/week01/checkpoints/bigram.pt",
-                           start_token=0, device="cuda")
-    text = decode(tokens, itos)
-    print("Generated text:", text)
-    
-    
+    main()
